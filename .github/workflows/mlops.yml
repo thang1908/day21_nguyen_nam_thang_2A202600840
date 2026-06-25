@@ -1,0 +1,143 @@
+name: MLOps Pipeline
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'data/**.dvc'
+      - 'src/**.py'
+      - 'params.yaml'
+  workflow_dispatch:
+
+jobs:
+  # 1. Chạy Unit Test
+  test:
+    name: Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run pytest
+        run: |
+          touch src/__init__.py tests/__init__.py
+          pytest tests/ -v
+
+  # 2. Huấn luyện mô hình
+  train:
+    name: Train Model
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Authenticate to GCS
+        run: |
+          echo '${{ secrets.CLOUD_CREDENTIALS }}' > sa-key.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$PWD/sa-key.json" >> $GITHUB_ENV
+
+      - name: Pull data from DVC
+        run: |
+          dvc remote modify myremote credentialpath sa-key.json
+          dvc pull
+
+      - name: Train model
+        run: python src/train.py
+
+      - name: Upload model to GCS
+        run: |
+          python - <<'EOF'
+          import os
+          from google.cloud import storage
+          client = storage.Client()
+          bucket = client.bucket("${{ secrets.CLOUD_BUCKET }}")
+          
+          old_blob = bucket.blob("models/latest/metrics.json")
+          if old_blob.exists():
+              old_blob.download_to_filename("outputs/old_metrics.json")
+              
+          blob = bucket.blob("models/latest/model.pkl")
+          blob.upload_from_filename("models/model.pkl")
+          
+          bucket.blob("models/latest/metrics.json").upload_from_filename("outputs/metrics.json")
+          print("Upload model thành công!")
+          EOF
+
+      - name: Upload metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics
+          path: outputs/
+
+  # 3. Kiểm tra chất lượng (Eval gate)
+  eval:
+    name: Eval Quality
+    needs: train
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: metrics
+          path: outputs
+      - name: Check accuracy threshold
+        run: |
+          python - <<'EOF'
+          import json, sys, os
+          new_acc = json.load(open('outputs/metrics.json'))['accuracy']
+          print(f"Accuracy mới: {new_acc}")
+          
+          if os.path.exists('outputs/old_metrics.json'):
+              old_acc = json.load(open('outputs/old_metrics.json'))['accuracy']
+              print(f"Accuracy cũ: {old_acc}")
+              if new_acc < old_acc:
+                  print("❌ Rollback: Model mới tệ hơn model cũ! Ngừng Deploy.")
+                  sys.exit(1)
+              else:
+                  print("✅ Pass: Model mới tốt hơn hoặc bằng model cũ.")
+          else:
+              print("Không tìm thấy model cũ để so sánh, bỏ qua check Rollback.")
+              
+          if new_acc < 0.60:
+              print("❌ Fail: Accuracy < 0.60")
+              sys.exit(1)
+              
+          sys.exit(0)
+          EOF
+
+  # 4. Triển khai (Deploy)
+  deploy:
+    name: Deploy to VM
+    needs: eval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Copy src to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: "src/*"
+          target: "/home/${{ secrets.VM_USER }}/src/"
+          strip_components: 1
+
+      - name: Restart API
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            sudo systemctl restart mlops-serve
+            sleep 15
+            curl -f http://localhost:8000/health || exit 1
